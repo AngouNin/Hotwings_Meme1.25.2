@@ -1,6 +1,8 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::*;
-use anchor_spl::token::{Token, TokenAccount};
+use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use spl_associated_token_account as associated;
+use spl_associated_token_account::create;
 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
@@ -84,7 +86,7 @@ pub mod hotwings {
     
         // Ensure we don’t process the same milestone multiple times
         require!(percentage > current_milestone * 10, CustomError::MilestoneNotReached);
-    
+        
         for user in lock_pool.users.iter_mut() {
             let total_to_unlock = user.total_tokens * percentage as u64 / 100;
             let newly_unlocked = total_to_unlock - user.unlocked_tokens;
@@ -105,6 +107,50 @@ pub mod hotwings {
     
         // Update current milestone
         lock_pool.current_milestone = (percentage / 10) as u8;
+    
+        Ok(())
+    }
+
+    pub fn full_unlock(ctx: Context<FullUnlock>) -> Result<()> {
+        let lock_pool = &mut ctx.accounts.lock_pool_account;
+    
+        // Ensure that the full unlock has not been executed yet
+        require!(!lock_pool.full_unlock_executed, CustomError::FullUnlockAlreadyExecuted);
+    
+        // Get the current Solana cluster time
+        let current_time = ctx.accounts.clock.unix_timestamp;
+    
+        // Ensure that 3 months have passed since `start_time`
+        require!(
+            current_time >= lock_pool.start_time + (3 * 30 * 24 * 60 * 60), // 3 months in seconds
+            CustomError::UnlockTooSoon
+        );
+    
+        // Iterate over all users to unlock their remaining locked tokens
+        for user in lock_pool.users.iter_mut() {
+            let newly_unlocked_tokens = user.locked_tokens; // All remaining locked tokens
+    
+            // Check to avoid unnecessary processing
+            if newly_unlocked_tokens > 0 {
+                // Update user's token state
+                user.unlocked_tokens += newly_unlocked_tokens;
+                user.locked_tokens = 0;
+    
+                // Transfer all remaining locked tokens from lock pool account to the user's wallet
+                let cpi_accounts = Transfer {
+                    from: ctx.accounts.lock_pool_token_account.to_account_info(),
+                    to: user.user_wallet.to_account_info(),
+                    authority: ctx.accounts.pda.to_account_info(),
+                };
+                let cpi_program = ctx.accounts.token_program.to_account_info();
+                let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+    
+                token::transfer(cpi_ctx, newly_unlocked_tokens)?;
+            }
+        }
+    
+        // Mark full unlock as executed
+        lock_pool.full_unlock_executed = true;
     
         Ok(())
     }
@@ -139,6 +185,7 @@ pub struct LockPoolState {
     pub users: Vec<UserLockInfo>,       // List of all users and locked info
     pub start_time: i64,  
     pub current_milestone: u8, 
+    pub full_unlock_executed: bool
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -153,17 +200,27 @@ pub struct UserLockInfo {
 pub struct UnlockTokens<'info> {
     #[account(mut)]
     pub lock_pool_account: Account<'info, LockPoolState>, // Global LockPoolState (tracks locking state across users)
-
     #[account(mut)]
     pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled SPL token account (the lock pool)
-
     /// CHECK: The PDA account, which acts as the authority for the LockPoolTokenAccount.
     pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
-
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the unlocking process
-
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
+}
+
+#[derive(Accounts)]
+pub struct FullUnlock<'info> {
+    #[account(mut)]
+    pub lock_pool_account: Account<'info, LockPoolState>, // Global LockPoolState (tracks locking state across users)
+    #[account(mut)]
+    pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled SPL token account (the lock pool)
+    /// CHECK: PDA authority over the LockPool Token Account
+    pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
+    #[account(mut)]
+    pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the full unlock operation
+    pub token_program: Program<'info, Token>, // SPL Token program for token transfers
+    pub clock: Sysvar<'info, Clock>, // Solana Clock Sysvar to fetch current cluster time
 }
 
 #[error_code]
