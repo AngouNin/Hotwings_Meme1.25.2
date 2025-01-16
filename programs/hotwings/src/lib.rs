@@ -1,8 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
-use spl_associated_token_account as associated;
-use spl_associated_token_account::create;
+use anchor_spl::token::{Token, TokenAccount, Transfer};
 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
@@ -229,10 +226,10 @@ pub enum CustomError {
     Unauthorized,
     #[msg("Market cap is not reached")]
     MilestoneNotReached,
-    // #[msg("Max hold amount exceeded")]
-    // MaxHoldExceeded,
-    // #[msg("Max supply amount exceeded")]
+    #[msg("Already Full Unlocked")]
+    FullUnlockAlreadyExecuted,
+    // // #[msg("Max supply amount exceeded")]
     // SupplyExceeded,
-    // #[msg("Three months have not yet passed since the token distribution.")]
-    // ThreeMonthsNotPassed,
+    #[msg("Three months have not yet passed since the token distribution.")]
+    UnlockTooSoon,
 }
