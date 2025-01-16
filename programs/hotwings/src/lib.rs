@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount, Transfer};
+use anchor_spl::token::{Token, TokenAccount, Transfer, Mint};
+use spl_associated_token_account::{self, get_associated_token_address};
 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
@@ -92,14 +93,24 @@ pub mod hotwings {
             user.locked_tokens -= newly_unlocked;     // Reduce locked tokens
     
             // Transfer unlocked tokens to the user
-            let cpi_accounts = Transfer {
-                from: ctx.accounts.lock_pool_token_account.to_account_info(),
-                to: user.user_wallet.to_account_info(),
-                authority: ctx.accounts.pda.to_account_info(),
-            };
-            let cpi_program = ctx.accounts.token_program.to_account_info();
-            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-            token::transfer(cpi_ctx, newly_unlocked)?;
+            // let cpi_accounts = Transfer {
+            //     from: ctx.accounts.lock_pool_token_account.to_account_info(),
+            //     to: user.user_wallet.to_account_info(),
+            //     authority: ctx.accounts.pda.to_account_info(),
+            // };
+            // let cpi_program = ctx.accounts.token_program.to_account_info();
+            // let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+            // token::transfer(cpi_ctx, newly_unlocked)?;
+            // Call the helper function to handle the transfer logic
+            handle_transfer(
+                admin.clone(),
+                ctx.accounts.lock_pool_token_account.clone(),
+                user.user_wallet.clone(),
+                ctx.accounts.token_mint.clone(),
+                ctx.accounts.token_program.clone(),
+                ctx.accounts.system_program.clone(),
+                newly_unlocked,
+            );
         }
     
         // Update current milestone
@@ -107,6 +118,7 @@ pub mod hotwings {
     
         Ok(())
     }
+    
 
     pub fn full_unlock(ctx: Context<FullUnlock>) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
@@ -187,7 +199,8 @@ pub struct LockPoolState {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct UserLockInfo {
-    pub user_wallet: Pubkey,            // Wallet address of the user
+    // pub user_wallet: Pubkey,            // Wallet address of the user
+    pub user_wallet: AccountInfo<'info>, // Receiver's public key
     pub total_tokens: u64,              // Purchased tokens during presale
     pub unlocked_tokens: u64,           // Unlocked tokens (via milestones)
     pub locked_tokens: u64,             // Remaining locked tokens
@@ -204,6 +217,8 @@ pub struct UnlockTokens<'info> {
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the unlocking process
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
+    pub token_mint: Account<'info, Mint>, // SPL Token Mint
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -219,6 +234,59 @@ pub struct FullUnlock<'info> {
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
     pub clock: Sysvar<'info, Clock>, // Solana Clock Sysvar to fetch current cluster time
 }
+
+
+// Helper function to handle token transfer
+fn handle_transfer(
+    sender: Signer,
+    sender_token_account: Account<TokenAccount>,
+    receiver: AccountInfo,
+    token_mint: Account<Mint>,
+    token_program: Program<Token>,
+    system_program: Program<System>,
+    amount: u64,
+) -> Result<()> {
+    // Get the receiver's associated token account address
+    let receiver_ata = get_associated_token_address(&receiver.key(), &token_mint.key());
+
+    // Check if the receiver's associated token account exists; if not, create it
+    let receiver_token_account_info = match anchor_lang::solana_program::account::Account::try_from_slice(&receiver_ata.to_bytes()) {
+        Ok(account) => account,
+        Err(_) => {
+            // Create the associated token account
+            let create_ata_ix = spl_associated_token_account::create_associated_token_account(
+                &sender.key(),
+                &receiver.key(),
+                &token_mint.key(),
+            );
+
+            anchor_lang::solana_program::program::invoke(
+                &create_ata_ix,
+                &[
+                    sender.to_account_info(),
+                    receiver.to_account_info(),
+                    token_mint.to_account_info(),
+                    system_program.to_account_info(),
+                    token_program.to_account_info(),
+                ],
+            )?;
+            // After creation, retrieve the new associated token account info
+            Account::<TokenAccount>::try_from_slice(&receiver_ata.to_bytes())?
+        }
+    };
+
+    // Transfer tokens from sender to receiver's associated token account
+    let cpi_accounts = token::Transfer {
+        from: sender_token_account.to_account_info(),
+        to: receiver_token_account_info.to_account_info(),
+        authority: sender.to_account_info(),
+    };
+
+    token::transfer(CpiContext::new(token_program.to_account_info(), cpi_accounts), amount)?;
+
+    Ok(())
+}
+
 
 #[error_code]
 pub enum CustomError {
