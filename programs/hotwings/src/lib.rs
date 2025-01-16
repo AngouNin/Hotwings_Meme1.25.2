@@ -2,6 +2,8 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use spl_associated_token_account::{self, get_associated_token_address};
 
+// use anchor_spl::associated_token::{self, AssociatedToken, Create};
+
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
 
@@ -237,7 +239,7 @@ pub struct FullUnlock<'info> {
     #[account(mut)]
     pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled SPL token account (the lock pool)
     /// CHECK: PDA authority over the LockPool Token Account
-    pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
+    // pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the full unlock operation
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
@@ -261,7 +263,8 @@ fn handle_transfer(
     let receiver_ata = get_associated_token_address(&receiver.key(), &token_mint.key());
 
     // Check if the receiver's associated token account exists; if not, create it
-    let receiver_token_account_info = match anchor_lang::solana_program::account::Account::try_from_slice(&receiver_ata.to_bytes()) {
+    // let receiver_token_account_info = match anchor_lang::solana_program::account::Account::try_from_slice(&receiver_ata.to_bytes()) {
+    let receiver_token_account_info = match Account::<TokenAccount>::try_from(&receiver_ata.to_bytes()) {
         Ok(account) => account,
         Err(_) => {
             // Create the associated token account
@@ -282,7 +285,7 @@ fn handle_transfer(
                 ],
             )?;
             // After creation, retrieve the new associated token account info
-            Account::<TokenAccount>::try_from_slice(&receiver_ata.to_bytes())?
+            Account::<TokenAccount>::try_from(&receiver_ata.to_bytes())?
         }
     };
 
