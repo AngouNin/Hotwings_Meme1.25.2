@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount, Transfer, Mint};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use spl_associated_token_account::{self, get_associated_token_address};
 
 
@@ -93,17 +93,9 @@ pub mod hotwings {
             user.locked_tokens -= newly_unlocked;     // Reduce locked tokens
     
             // Transfer unlocked tokens to the user
-            // let cpi_accounts = Transfer {
-            //     from: ctx.accounts.lock_pool_token_account.to_account_info(),
-            //     to: user.user_wallet.to_account_info(),
-            //     authority: ctx.accounts.pda.to_account_info(),
-            // };
-            // let cpi_program = ctx.accounts.token_program.to_account_info();
-            // let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-            // token::transfer(cpi_ctx, newly_unlocked)?;
             // Call the helper function to handle the transfer logic
             handle_transfer(
-                admin.clone(),
+                ctx.accounts.admin_wallet.clone(),
                 ctx.accounts.lock_pool_token_account.clone(),
                 user.user_wallet.clone(),
                 ctx.accounts.token_mint.clone(),
@@ -122,9 +114,14 @@ pub mod hotwings {
 
     pub fn full_unlock(ctx: Context<FullUnlock>) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
-    
+        
         // Ensure that the full unlock has not been executed yet
         require!(!lock_pool.full_unlock_executed, CustomError::FullUnlockAlreadyExecuted);
+
+        // Ensure the `admin_wallet` is the authorized signer
+        let admin = &ctx.accounts.admin_wallet;
+        require!(admin.is_signer, CustomError::Unauthorized); // Check if the admin is the signer
+        
     
         // Get the current Solana cluster time
         let current_time = ctx.accounts.clock.unix_timestamp;
@@ -146,15 +143,27 @@ pub mod hotwings {
                 user.locked_tokens = 0;
     
                 // Transfer all remaining locked tokens from lock pool account to the user's wallet
-                let cpi_accounts = Transfer {
-                    from: ctx.accounts.lock_pool_token_account.to_account_info(),
-                    to: user.user_wallet.to_account_info(),
-                    authority: ctx.accounts.pda.to_account_info(),
-                };
-                let cpi_program = ctx.accounts.token_program.to_account_info();
-                let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+                // let cpi_accounts = Transfer {
+                //     from: ctx.accounts.lock_pool_token_account.to_account_info(),
+                //     to: user.user_wallet.to_account_info(),
+                //     authority: ctx.accounts.pda.to_account_info(),
+                // };
+                // let cpi_program = ctx.accounts.token_program.to_account_info();
+                // let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
     
-                token::transfer(cpi_ctx, newly_unlocked_tokens)?;
+                // token::transfer(cpi_ctx, newly_unlocked_tokens)?;
+                
+                // Transfer unlocked tokens to the user
+                // Call the helper function to handle the transfer logic
+                handle_transfer(
+                    ctx.accounts.admin_wallet.clone(),
+                    ctx.accounts.lock_pool_token_account.clone(),
+                    user.user_wallet.clone(),
+                    ctx.accounts.token_mint.clone(),
+                    ctx.accounts.token_program.clone(),
+                    ctx.accounts.system_program.clone(),
+                    newly_unlocked_tokens,
+                );
             }
         }
     
@@ -233,6 +242,8 @@ pub struct FullUnlock<'info> {
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the full unlock operation
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
     pub clock: Sysvar<'info, Clock>, // Solana Clock Sysvar to fetch current cluster time
+    pub token_mint: Account<'info, Mint>, // SPL Token Mint
+    pub system_program: Program<'info, System>,
 }
 
 
