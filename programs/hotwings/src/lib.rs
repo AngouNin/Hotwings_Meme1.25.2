@@ -1,51 +1,19 @@
-use spl_token_2022_extension_transfer_hook::state::*;
-use spl_token_2022_extension_transfer_hook::instruction::initialize_transfer_hook;
-
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount, Transfer};
-
-use solana_program::{
-    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
+use spl_token_2022::{
+    instruction::{initialize_mint_with_extension, ExtensionType},
+    state::Mint,
 };
+use solana_sdk::signature::Keypair;
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
 
-// Initialize your Token 2022 with TransferHook enabled
 
 #[program]
 pub mod hotwings {
     use anchor_spl::token;
 
     use super::*;
-
-        
-    pub fn initialize_token_with_transfer_hook(
-        ctx: Context<InitializeTokenWithTransferHook>,
-    ) -> Result<()> {
-        // Initialize the TransferHookAccount for the Token Mint
-        let mut transfer_hook_data = TransferHookAccount::default();
-        transfer_hook_data.enabled = true;
-
-        // Add Transfer Hook during mint creation
-        let cpi_accounts = InitializeMint {
-            mint: ctx.accounts.token_mint.to_account_info(),
-            rent: ctx.accounts.rent.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
-
-        // Call the Token2022 InitializeMint and attach the TransferHookAccount
-        spl_token_2022::instruction::initialize_mint(
-            ctx.accounts.token_program.key, // Token-2022 program ID
-            &ctx.accounts.token_mint.key(), // Token Mint account
-            &ctx.accounts.mint_authority.key, // Mint authority
-            Some(&ctx.accounts.payer.key), // Freeze authority (optional)
-            transfer_hook_data, // Enable the TransferHook during initialization
-        )?;
-
-        Ok(())
-    }
-
-    
 
     pub fn initialize_lock_accounts(
         ctx: Context<InitializeLockAccounts>,
@@ -223,6 +191,23 @@ pub mod hotwings {
 
 }
 
+// =======================================================struct=============================================
+
+#[derive(Accounts)]
+pub struct TransferHookContext<'info> {
+    #[account(mut)]
+    pub source_wallet: Account<'info, TokenAccount>, // Source of the transfer
+    #[account(mut)]
+    pub destination_wallet: Account<'info, TokenAccount>, // Destination of the transfer
+    #[account(mut)]
+    pub burn_wallet: Account<'info, TokenAccount>, // Burn Wallet
+    #[account(mut)]
+    pub marketing_wallet: Account<'info, TokenAccount>, // Marketing Wallet
+    /// CHECK: The transfer instruction (modifies amount)
+    pub transfer_instruction: AccountInfo<'info>,
+    pub authority: AccountInfo<'info>, // PDA for Token Authority
+    pub token_program: Program<'info, Token>, // SPL Token program
+}
 
 #[derive(Accounts)]
 pub struct InitializeLockAccounts<'info> {
@@ -339,68 +324,142 @@ fn milestone_percentage_from_milestone(current_milestone: u8) -> u8 {
     }
 }
 
-#[derive(Accounts)]
-pub struct InitializeTokenWithTransferHook<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>, // The wallet paying for the transaction (e.g., admin wallet)
+// =============================================TransferHook================================================
 
-    #[account(
-        init,
-        payer = payer,
-        mint::decimal = 6, // Set the token decimals
-        mint::authority = mint_authority, // Assign the mint authority
-        space = 82 + std::mem::size_of::<TransferHookAccount>(), // Reserve space for the TransferHook extension
-    )]
-    pub token_mint: Account<'info, Mint>, // The token mint being initialized
+fn initialize_token_with_transfer_hook(
+    payer: Pubkey,
+    mint_authority: Pubkey,
+    freeze_authority: Option<Pubkey>,
+) -> Result<()> {
+    let mint = Keypair::new(); // Generate a keypair for the mint
 
-    /// Initialize with any additional authorities if needed
-    pub mint_authority: AccountInfo<'info>, // The mint authority account
+    // Specify the extensions to enable
+    let extensions = vec![
+        ExtensionType::TransferHook, // Enables the TransferHook logic
+    ];
 
-    /// System programs and supporting accounts
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
-    pub token_program: Program<'info, Token2022>, // Use Token-2022 program
-}
+    // Create the mint with the above extensions
+    let instruction = initialize_mint_with_extension(
+        &spl_token_2022::id(),
+        &mint.pubkey(),
+        &payer,
+        &mint_authority,
+        freeze_authority.as_ref(),
+        extensions, // TransferHook extension
+    );
 
-entrypoint!(process_transfer);
-fn process_transfer(
-    program_id: &Pubkey,
-    accounts: &[AccountInfo],
-    instruction_data: &[u8],
-) -> ProgramResult {
-    // Parse accounts (sender, receiver)
-    let sender = accounts[0];
-    let receiver = accounts[1];
+    // Send the transaction to initialize the mint
+    let tx = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&payer),
+        &[payer_signer],
+        recent_blockhash,
+    );
+    banks_client.process_transaction(tx)?;
 
-    // Identify if the transaction is a DEX transaction
-    let is_dex_transaction = check_dex_transaction(sender, receiver);
-
-    if is_dex_transaction {
-        // Apply Tax Logic
-        let amount = get_transfer_amount(instruction_data); // Extract the transfer amount
-        let tax = amount * 15 / 1000; // 1.5% tax in basis points (bps)
-        let burn_amount = tax / 2; // 0.75% burn
-        let marketing_amount = tax / 2; // 0.75% marketing
-
-        // Deduct from user amount and allocate to burn/marketing
-        allocate_funds(sender, receiver, burn_amount, marketing_amount);
-    }
-
-    // Proceed with transfer for non-taxed transactions
     Ok(())
 }
 
-fn check_dex_transaction(sender: &AccountInfo, receiver: &AccountInfo) -> bool {
-    // Compare sender/receiver to known DEX program IDs
-    let dex_program_ids = vec![/* Add known DEX program IDs here */];
-    dex_program_ids.contains(&sender.owner) || dex_program_ids.contains(&receiver.owner)
+pub fn process_transfer_hook(ctx: Context<TransferHookContext>) -> Result<()> {
+    // Extract the program IDs for source and destination
+    let source_program_id = ctx.accounts.source_wallet.owner(); // SPL Token account owning program ID
+    let destination_program_id = ctx.accounts.destination_wallet.owner(); // SPL Token account owning program ID
+
+    // Check if it's a DEX transaction
+    let is_dex = is_dex_transaction(source_program_id, destination_program_id);
+
+    if is_dex {
+        // Tax Logic
+        let transfer_amount = ctx.accounts.transfer_instruction.amount;
+        let tax = transfer_amount * 15 / 1000; // 1.5% total tax
+        let burn_amount = tax / 2; // 0.75% for Burn
+        let marketing_amount = tax / 2; // 0.75% for Marketing Wallet
+        let net_transfer = transfer_amount - tax;
+
+        // Burn tokens
+        let cpi_ctx_burn = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.source_wallet.to_account_info(),
+                to: ctx.accounts.burn_wallet.to_account_info(),
+                authority: ctx.accounts.authority.clone(),
+            },
+            ctx.signer_seeds, // PDA signer
+        );
+        token::transfer(cpi_ctx_burn, burn_amount)?;
+
+        // Send tokens to marketing wallet
+        let cpi_ctx_marketing = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.source_wallet.to_account_info(),
+                to: ctx.accounts.marketing_wallet.to_account_info(),
+                authority: ctx.accounts.authority.clone(),
+            },
+            ctx.signer_seeds, // PDA signer
+        );
+        token::transfer(cpi_ctx_marketing, marketing_amount)?;
+
+        // Update the final amount to be transferred
+        ctx.accounts.transfer_instruction.amount = net_transfer;
+    }
+
+    // Allow the transfer to proceed
+    Ok(())
 }
 
-fn allocate_funds(sender: &AccountInfo, receiver: &AccountInfo, burn: u64, marketing: u64) {
-    // Transfer tokens to burn and marketing addresses
-    transfer(sender, &burn_wallet(), burn);
-    transfer(sender, &marketing_wallet(), marketing);
+// Known DEX program IDs
+const SERUM_DEX_PROGRAM_ID_DEV_1: Pubkey = Pubkey::new_from_array([DESVgJVGajEgKGXhb6XmqDHGz3VjdgP7rEVESBgxmroY]); ///DevNET
+const SERUM_DEX_PROGRAM_ID_MAIN_1: Pubkey = Pubkey::new_from_array([9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin]); ///MainNET
+const RAYDIUM_PROGRAM_ID_DEV_1: Pubkey = Pubkey::new_from_array([CPMDWBwJDtYax9qW7AyRuVC19Cc4L4Vcy4n2BHAbHkCW]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_DEV_2: Pubkey = Pubkey::new_from_array([HWy1jotHpo6UqeQxx49dpYYdQB8wj9Qk9MdxwjLvDHB8]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_DEV_3: Pubkey = Pubkey::new_from_array([DDg4VmQaJV9ogWce7LpcjBA9bv22wRp5uaTPa5pGjijF]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_DEV_4: Pubkey = Pubkey::new_from_array([devi51mZmdwUJGU9hjN27vEz64Gps7uUefqxg27EAtH]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_DEV_5: Pubkey = Pubkey::new_from_array([85BFyr98MbCUU9MVTEgzx1nbhWACbJqLzho6zd6DZcWL]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_DEV_6: Pubkey = Pubkey::new_from_array([EcLzTrNg9V7qhcdyXDe2qjtPkiGzDM2UbdRaeaadU5r2]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_DEV_7: Pubkey = Pubkey::new_from_array([BVChZ3XFEwTMUk1o9i3HAf91H6mFxSwa5X2wFAWhYPhU]);    ///DevNET
+const RAYDIUM_PROGRAM_ID_MAIN_1: Pubkey = Pubkey::new_from_array([CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_2: Pubkey = Pubkey::new_from_array([675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_3: Pubkey = Pubkey::new_from_array([5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_4: Pubkey = Pubkey::new_from_array([CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_5: Pubkey = Pubkey::new_from_array([routeUGWgWzqBWFcrCfv8tritsqukccJPu3q5GPP3xS]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_6: Pubkey = Pubkey::new_from_array([EhhTKczWMGQt46ynNeRX1WfeagwwJd7ufHvCDjRxjo5Q]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_7: Pubkey = Pubkey::new_from_array([9KEPoZmtHUrBbhWN1v1KWLMkkvwY6WLtAVUCPRtRjP4z]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_8: Pubkey = Pubkey::new_from_array([FarmqiPv5eAj3j1GMdMCMUGXqPUvmquZtMy86QH6rzhG]);    ///MainNET
+const RAYDIUM_PROGRAM_ID_MAIN_9: Pubkey = Pubkey::new_from_array([9HzJyW1qZsEiSfMUf6L2jo3CcTKAyBmSyKdwQeYisHrC]);    ///MainNET
+const ORCA_PROGRAM_ID_MAIN_1: Pubkey = Pubkey::new_from_array([whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc]);    ///MainNET
+
+// Helper function to determine if a transaction is associated with a DEX
+fn is_dex_transaction(source_program_id: &Pubkey, destination_program_id: &Pubkey) -> bool {
+    // Known DEX program IDs
+    const KNOWN_DEX_PROGRAMS: [&Pubkey; 3] = [
+        &SERUM_DEX_PROGRAM_ID_DEV_1,
+        &SERUM_DEX_PROGRAM_ID_MAIN_1,
+        &RAYDIUM_PROGRAM_ID_DEV_1,
+        &RAYDIUM_PROGRAM_ID_DEV_2,
+        &RAYDIUM_PROGRAM_ID_DEV_3,
+        &RAYDIUM_PROGRAM_ID_DEV_4,
+        &RAYDIUM_PROGRAM_ID_DEV_5,
+        &RAYDIUM_PROGRAM_ID_DEV_6,
+        &RAYDIUM_PROGRAM_ID_DEV_7,
+        &RAYDIUM_PROGRAM_ID_MAIN_1,
+        &RAYDIUM_PROGRAM_ID_MAIN_2,
+        &RAYDIUM_PROGRAM_ID_MAIN_3,
+        &RAYDIUM_PROGRAM_ID_MAIN_4,
+        &RAYDIUM_PROGRAM_ID_MAIN_5,
+        &RAYDIUM_PROGRAM_ID_MAIN_6,
+        &RAYDIUM_PROGRAM_ID_MAIN_7,
+        &RAYDIUM_PROGRAM_ID_MAIN_8,
+        &RAYDIUM_PROGRAM_ID_MAIN_9,
+        &ORCA_PROGRAM_ID_MAIN_1,
+    ];
+
+    // Check if source or destination is a known DEX program
+    KNOWN_DEX_PROGRAMS.contains(source_program_id) || KNOWN_DEX_PROGRAMS.contains(destination_program_id)
 }
+
+
+// =====================================================Error=============================================
 
 #[error_code]
 pub enum CustomError {
@@ -417,4 +476,3 @@ pub enum CustomError {
     #[msg("Insufficient Pool Balance")]
     InsufficientPoolBalance,
 }
-
