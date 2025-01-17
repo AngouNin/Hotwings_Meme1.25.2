@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use spl_associated_token_account::{self, get_associated_token_address};
-
-// use anchor_spl::associated_token::{self, AssociatedToken, Create};
+use anchor_spl::token::{Token, TokenAccount, Transfer};
+use spl_associated_token_account::{create_associated_token_account, get_associated_token_address};
+use spl_token::instruction::transfer;
+use spl_token::state::Account as TokenAccount;
 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
@@ -95,16 +95,14 @@ pub mod hotwings {
             user.locked_tokens -= newly_unlocked;     // Reduce locked tokens
     
             // Transfer unlocked tokens to the user
-            // Call the helper function to handle the transfer logic
-            handle_transfer(
-                ctx.accounts.admin_wallet.clone(),
-                ctx.accounts.lock_pool_token_account.clone(),
-                user.user_wallet.clone(),
-                ctx.accounts.token_mint.clone(),
+            transfer_unlocked_tokens(
+                ctx.accounts.lock_pool_token_account.clone(), 
+                user.user_wallet, 
+                ctx.accounts.mint.key(),
+                &ctx.accounts.admin_wallet, 
                 ctx.accounts.token_program.clone(),
-                ctx.accounts.system_program.clone(),
                 newly_unlocked,
-            );
+            )?;
         }
     
         // Update current milestone
@@ -112,18 +110,12 @@ pub mod hotwings {
     
         Ok(())
     }
-    
 
     pub fn full_unlock(ctx: Context<FullUnlock>) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
-        
+    
         // Ensure that the full unlock has not been executed yet
         require!(!lock_pool.full_unlock_executed, CustomError::FullUnlockAlreadyExecuted);
-
-        // Ensure the `admin_wallet` is the authorized signer
-        let admin = &ctx.accounts.admin_wallet;
-        require!(admin.is_signer, CustomError::Unauthorized); // Check if the admin is the signer
-        
     
         // Get the current Solana cluster time
         let current_time = ctx.accounts.clock.unix_timestamp;
@@ -154,18 +146,14 @@ pub mod hotwings {
                 // let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
     
                 // token::transfer(cpi_ctx, newly_unlocked_tokens)?;
-                
-                // Transfer unlocked tokens to the user
-                // Call the helper function to handle the transfer logic
-                handle_transfer(
-                    ctx.accounts.admin_wallet.clone(),
-                    ctx.accounts.lock_pool_token_account.clone(),
-                    user.user_wallet.clone(),
-                    ctx.accounts.token_mint.clone(),
+                transfer_unlocked_tokens(
+                    ctx.accounts.lock_pool_token_account.clone(), 
+                    user.user_wallet, 
+                    ctx.accounts.mint.key(),
+                    &ctx.accounts.admin_wallet, 
                     ctx.accounts.token_program.clone(),
-                    ctx.accounts.system_program.clone(),
                     newly_unlocked_tokens,
-                );
+                )?;
             }
         }
     
@@ -210,8 +198,7 @@ pub struct LockPoolState {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct UserLockInfo {
-    // pub user_wallet: Pubkey,            // Wallet address of the user
-    pub user_wallet: AccountInfo<'info>, // Receiver's public key
+    pub user_wallet: Pubkey,            // Wallet address of the user
     pub total_tokens: u64,              // Purchased tokens during presale
     pub unlocked_tokens: u64,           // Unlocked tokens (via milestones)
     pub locked_tokens: u64,             // Remaining locked tokens
@@ -224,12 +211,11 @@ pub struct UnlockTokens<'info> {
     #[account(mut)]
     pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled SPL token account (the lock pool)
     /// CHECK: The PDA account, which acts as the authority for the LockPoolTokenAccount.
-    pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
+    // pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the unlocking process
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
-    pub token_mint: Account<'info, Mint>, // SPL Token Mint
-    pub system_program: Program<'info, System>,
+    pub mint: AccountInfo<'info>,               // The mint address of the SPL token
 }
 
 #[derive(Accounts)]
@@ -239,68 +225,65 @@ pub struct FullUnlock<'info> {
     #[account(mut)]
     pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled SPL token account (the lock pool)
     /// CHECK: PDA authority over the LockPool Token Account
-    // pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
+    pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the full unlock operation
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
     pub clock: Sysvar<'info, Clock>, // Solana Clock Sysvar to fetch current cluster time
-    pub token_mint: Account<'info, Mint>, // SPL Token Mint
-    pub system_program: Program<'info, System>,
+    pub mint: AccountInfo<'info>,               // The mint address of the SPL token
+
 }
 
-
-// Helper function to handle token transfer
-fn handle_transfer(
-    sender: Signer,
-    sender_token_account: Account<TokenAccount>,
-    receiver: AccountInfo,
-    token_mint: Account<Mint>,
-    token_program: Program<Token>,
-    system_program: Program<System>,
+// Helper function to transfer unlocked tokens
+pub fn transfer_unlocked_tokens(
+    sender_account: Account<'_, TokenAccount>,
+    recipient_pubkey: Pubkey,
+    mint_pubkey: Pubkey,
+    sender_authority: &Signer,
+    token_program: Program<'_, Token>,
     amount: u64,
 ) -> Result<()> {
-    // Get the receiver's associated token account address
-    let receiver_ata = get_associated_token_address(&receiver.key(), &token_mint.key());
+    // Derive the recipient's associated token account
+    let recipient_token_account = get_associated_token_address(&recipient_pubkey, &mint_pubkey);
 
-    // Check if the receiver's associated token account exists; if not, create it
-    // let receiver_token_account_info = match anchor_lang::solana_program::account::Account::try_from_slice(&receiver_ata.to_bytes()) {
-    let receiver_token_account_info = match Account::<TokenAccount>::try_from(&receiver_ata.to_bytes()) {
-        Ok(account) => account,
+    // Attempt to get the associated token account's mutable reference
+    // Attempt to load the recipient_token_account as an Account<TokenAccount>
+    // Attempt to load the recipient_token_account as an Account<TokenAccount>
+    let recipient_token_info = match Account::<TokenAccount>::try_from(&recipient_token_account) {
+        Ok(info) => info, // If it exists, use it
         Err(_) => {
-            // Create the associated token account
-            let create_ata_ix = spl_associated_token_account::create_associated_token_account(
-                &sender.key(),
-                &receiver.key(),
-                &token_mint.key(),
+            // If it doesn't exist, create it
+            let create_token_account_ix = create_associated_token_account(
+                &sender_authority.key(),
+                &recipient_pubkey,
+                &mint_pubkey,
             );
 
-            anchor_lang::solana_program::program::invoke(
-                &create_ata_ix,
-                &[
-                    sender.to_account_info(),
-                    receiver.to_account_info(),
-                    token_mint.to_account_info(),
-                    system_program.to_account_info(),
-                    token_program.to_account_info(),
-                ],
-            )?;
-            // After creation, retrieve the new associated token account info
-            Account::<TokenAccount>::try_from(&receiver_ata.to_bytes())?
+            // Invoke the creation instruction
+            let invoke_context = CpiContext::new(token_program.clone(), create_token_account_ix);
+            invoke_signed(invoke_context)?;
+
+            // Access the token account after creation
+            Account::<TokenAccount>::try_from(&recipient_token_account)?
         }
     };
 
-    // Transfer tokens from sender to receiver's associated token account
-    let cpi_accounts = token::Transfer {
-        from: sender_token_account.to_account_info(),
-        to: receiver_token_account_info.to_account_info(),
-        authority: sender.to_account_info(),
+    // Verify the sender's balance
+    let sender_balance: u64 = sender_account.amount; // Directly access the sender's amount
+    require!(sender_balance >= amount, CustomError::InsufficientFunds);
+
+    // Create transfer instruction
+    let transfer_accounts = transfer::Transfer {
+        from: sender_account.to_account_info(),
+        to: recipient_token_info.to_account_info(),
+        authority: sender_authority.to_account_info(),
     };
 
-    token::transfer(CpiContext::new(token_program.to_account_info(), cpi_accounts), amount)?;
+    let transfer_context = CpiContext::new(token_program, transfer_accounts);
+    transfer(transfer_context, amount)?;
 
     Ok(())
 }
-
 
 #[error_code]
 pub enum CustomError {
@@ -309,9 +292,9 @@ pub enum CustomError {
     #[msg("Market cap is not reached")]
     MilestoneNotReached,
     #[msg("Already Full Unlocked")]
-    FullUnlockAlreadyExecuted,
-    // // #[msg("Max supply amount exceeded")]
-    // SupplyExceeded,
+    FullUnlockAlreadyExecuted, 
     #[msg("Three months have not yet passed since the token distribution.")]
     UnlockTooSoon,
+    #[msg("Insufficient funds in sender's account.")]
+    InsufficientFunds,
 }
