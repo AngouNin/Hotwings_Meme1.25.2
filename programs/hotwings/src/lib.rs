@@ -1,15 +1,51 @@
+use spl_token_2022_extension_transfer_hook::state::*;
+use spl_token_2022_extension_transfer_hook::instruction::initialize_transfer_hook;
+
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Token, TokenAccount, Transfer};
 
+use solana_program::{
+    account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
+};
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
 
+// Initialize your Token 2022 with TransferHook enabled
 
 #[program]
 pub mod hotwings {
     use anchor_spl::token;
 
     use super::*;
+
+        
+    pub fn initialize_token_with_transfer_hook(
+        ctx: Context<InitializeTokenWithTransferHook>,
+    ) -> Result<()> {
+        // Initialize the TransferHookAccount for the Token Mint
+        let mut transfer_hook_data = TransferHookAccount::default();
+        transfer_hook_data.enabled = true;
+
+        // Add Transfer Hook during mint creation
+        let cpi_accounts = InitializeMint {
+            mint: ctx.accounts.token_mint.to_account_info(),
+            rent: ctx.accounts.rent.to_account_info(),
+        };
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
+
+        // Call the Token2022 InitializeMint and attach the TransferHookAccount
+        spl_token_2022::instruction::initialize_mint(
+            ctx.accounts.token_program.key, // Token-2022 program ID
+            &ctx.accounts.token_mint.key(), // Token Mint account
+            &ctx.accounts.mint_authority.key, // Mint authority
+            Some(&ctx.accounts.payer.key), // Freeze authority (optional)
+            transfer_hook_data, // Enable the TransferHook during initialization
+        )?;
+
+        Ok(())
+    }
+
+    
 
     pub fn initialize_lock_accounts(
         ctx: Context<InitializeLockAccounts>,
@@ -303,6 +339,69 @@ fn milestone_percentage_from_milestone(current_milestone: u8) -> u8 {
     }
 }
 
+#[derive(Accounts)]
+pub struct InitializeTokenWithTransferHook<'info> {
+    #[account(mut)]
+    pub payer: Signer<'info>, // The wallet paying for the transaction (e.g., admin wallet)
+
+    #[account(
+        init,
+        payer = payer,
+        mint::decimal = 6, // Set the token decimals
+        mint::authority = mint_authority, // Assign the mint authority
+        space = 82 + std::mem::size_of::<TransferHookAccount>(), // Reserve space for the TransferHook extension
+    )]
+    pub token_mint: Account<'info, Mint>, // The token mint being initialized
+
+    /// Initialize with any additional authorities if needed
+    pub mint_authority: AccountInfo<'info>, // The mint authority account
+
+    /// System programs and supporting accounts
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+    pub token_program: Program<'info, Token2022>, // Use Token-2022 program
+}
+
+entrypoint!(process_transfer);
+fn process_transfer(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    instruction_data: &[u8],
+) -> ProgramResult {
+    // Parse accounts (sender, receiver)
+    let sender = accounts[0];
+    let receiver = accounts[1];
+
+    // Identify if the transaction is a DEX transaction
+    let is_dex_transaction = check_dex_transaction(sender, receiver);
+
+    if is_dex_transaction {
+        // Apply Tax Logic
+        let amount = get_transfer_amount(instruction_data); // Extract the transfer amount
+        let tax = amount * 15 / 1000; // 1.5% tax in basis points (bps)
+        let burn_amount = tax / 2; // 0.75% burn
+        let marketing_amount = tax / 2; // 0.75% marketing
+
+        // Deduct from user amount and allocate to burn/marketing
+        allocate_funds(sender, receiver, burn_amount, marketing_amount);
+    }
+
+    // Proceed with transfer for non-taxed transactions
+    Ok(())
+}
+
+fn check_dex_transaction(sender: &AccountInfo, receiver: &AccountInfo) -> bool {
+    // Compare sender/receiver to known DEX program IDs
+    let dex_program_ids = vec![/* Add known DEX program IDs here */];
+    dex_program_ids.contains(&sender.owner) || dex_program_ids.contains(&receiver.owner)
+}
+
+fn allocate_funds(sender: &AccountInfo, receiver: &AccountInfo, burn: u64, marketing: u64) {
+    // Transfer tokens to burn and marketing addresses
+    transfer(sender, &burn_wallet(), burn);
+    transfer(sender, &marketing_wallet(), marketing);
+}
+
 #[error_code]
 pub enum CustomError {
     #[msg("You are not authorized to call this instruction.")]
@@ -318,3 +417,4 @@ pub enum CustomError {
     #[msg("Insufficient Pool Balance")]
     InsufficientPoolBalance,
 }
+
