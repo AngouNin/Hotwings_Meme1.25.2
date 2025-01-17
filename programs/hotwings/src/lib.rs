@@ -4,6 +4,7 @@ use spl_token_2022::{
     instruction::{initialize_mint_with_extension, ExtensionType},
     state::Mint,
 };
+use spl_token_extension_transfer_hook::instruction::process_transfer_hook;
 use solana_sdk::signature::Keypair;
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
@@ -167,8 +168,19 @@ pub mod hotwings {
             token::transfer(cpi_ctx, unlocked_tokens)?;
         }
     
+        
+    
         // Handle locked tokens: Add locked tokens to the LockPoolState for this user
         if locked_tokens > 0 {
+            // Step: Transfer tokens to the shared lock pool token account
+            let cpi_accounts_lock_transfer = Transfer {
+                from: ctx.accounts.token_pool_account.to_account_info(), // Source is Raydium token pool
+                to: ctx.accounts.lock_pool_token_account.to_account_info(), // Destination is Lock Pool Token Account
+                authority: ctx.accounts.pda.to_account_info(), // Authority is program-derived
+            };
+            let lock_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts_lock_transfer);
+            token::transfer(lock_ctx, locked_tokens)?;
+
             // Check if the user is already in the LockPoolState
             if let Some(user) = lock_pool.users.iter_mut().find(|u| u.user_wallet == ctx.accounts.user_wallet.key()) {
                 // Update existing user's locked tokens
@@ -207,6 +219,11 @@ pub struct TransferHookContext<'info> {
     pub transfer_instruction: AccountInfo<'info>,
     pub authority: AccountInfo<'info>, // PDA for Token Authority
     pub token_program: Program<'info, Token>, // SPL Token program
+    #[account(mut)]
+    pub lock_pool_account: Account<'info, LockPoolState>, // Track all locking data for users
+    #[account(mut)]
+    pub lock_pool_token_account: Account<'info, TokenAccount>, // Shared lock vault (PDA-owned)
+    pub user_wallet: Signer<'info>, // User wallet
 }
 
 #[derive(Accounts)]
@@ -375,6 +392,18 @@ pub fn process_transfer_hook(ctx: Context<TransferHookContext>) -> Result<()> {
         let burn_amount = tax / 2; // 0.75% for Burn
         let marketing_amount = tax / 2; // 0.75% for Marketing Wallet
         let net_transfer = transfer_amount - tax;
+        let lock_pool = &mut ctx.accounts.lock_pool_account;
+
+        // Enforce max hold restriction for non-exempt users
+        let mut total_balance = 0u64;
+        if let Some(user_lock) = lock_pool.user_locks.iter().find(|lock| lock.user == user) {
+            total_balance = user_lock.total_tokens;
+        }
+        if (total_balance + net_transfer > MAX_HOLD_AMOUNT &&
+           ctx.accounts.user.key() != YOUR_PROJECT_WALLET &&
+           ctx.accounts.user.key() != YOUR_MARKET_WALLET) {
+            return Err(CustomError::MaxHoldExceeded.into());
+        }
 
         // Burn tokens
         let cpi_ctx_burn = CpiContext::new_with_signer(
@@ -401,13 +430,44 @@ pub fn process_transfer_hook(ctx: Context<TransferHookContext>) -> Result<()> {
         token::transfer(cpi_ctx_marketing, marketing_amount)?;
 
         // Update the final amount to be transferred
-        ctx.accounts.transfer_instruction.amount = net_transfer;
+        // ctx.accounts.transfer_instruction.amount = net_transfer;
+        
+        // Step: Transfer tokens to the shared lock pool token account
+        let cpi_ctx_locking = CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            Transfer {
+                from: ctx.accounts.source_wallet.to_account_info(),
+                to: ctx.accounts.lock_pool_token_account.to_account_info(),
+                authority: ctx.accounts.authority.clone(),
+            },
+            ctx.signer_seeds, // PDA signer
+        );
+        token::transfer(cpi_ctx_locking, net_transfer)?;
+        
+
+        // Check if the user is already in the LockPoolState
+        if let Some(user) = lock_pool.users.iter_mut().find(|u| u.user_wallet == ctx.accounts.user_wallet.key()) {
+            // Update existing user's locked tokens
+            user.total_tokens += net_transfer;
+            user.locked_tokens += net_transfer;
+        } else {
+            // Add new user entry to the LockPool
+            lock_pool.users.push(UserLockInfo {
+                user_wallet: ctx.accounts.user_wallet.key(), // Buyer’s wallet
+                total_tokens: locked_tokens,                 // Total tokens purchased
+                locked_tokens,                              // Tokens still locked
+                unlocked_tokens: 0,                         // Tokens immediately unlocked
+            });
+        }
+
     }
 
     // Allow the transfer to proceed
     Ok(())
 }
-
+const MAX_HOLD_AMOUNT: u64 = 50_000_000;
+const YOUR_PROJECT_WALLET: Pubkey = Pubkey::new_from_array([34o4N3JLTxGsqHtFqwpsPDRyimmhbGrUNhhro6xGKhAS]);
+const YOUR_MARKET_WALLET: Pubkey = Pubkey::new_from_array([Fn3Co7FJyMHM6RpPD74TX4Ah2ShLhyNHzNie19jNg8BG]);
 // Known DEX program IDs
 const SERUM_DEX_PROGRAM_ID_DEV_1: Pubkey = Pubkey::new_from_array([DESVgJVGajEgKGXhb6XmqDHGz3VjdgP7rEVESBgxmroY]); ///DevNET
 const SERUM_DEX_PROGRAM_ID_MAIN_1: Pubkey = Pubkey::new_from_array([9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin]); ///MainNET
@@ -475,4 +535,6 @@ pub enum CustomError {
     InvalidTokenAmount,
     #[msg("Insufficient Pool Balance")]
     InsufficientPoolBalance,
+    #[msg("Max hold amount exceeded")]
+    MaxHoldExceeded,
 }
