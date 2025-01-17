@@ -1,32 +1,9 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-use spl_associated_token_account::{self, get_associated_token_address};
-
-// use anchor_spl::associated_token::{self, AssociatedToken, Create};
+use anchor_spl::token::{Token, TokenAccount, Transfer};
 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
 
-fn milestone_percentage(market_cap: u64) -> u8 {
-    if market_cap >= 2_500_000 {
-        return 100; // If the market cap exceeds or equals the last milestone, unlock 100%
-    } else if market_cap >= 1_574_000 {
-        return 70; // Milestone 7
-    } else if market_cap >= 997_000 {
-        return 60; // Milestone 6
-    } else if market_cap >= 650_000 {
-        return 50; // Milestone 5
-    } else if market_cap >= 395_000 {
-        return 40; // Milestone 4
-    } else if market_cap >= 225_000 {
-        return 30; // Milestone 3
-    } else if market_cap >= 105_500 {
-        return 20; // Milestone 2
-    } else if market_cap >= 45_000 {
-        return 10; // Milestone 1
-    }
-    0 // If market cap is below the first milestone, no tokens are unlocked
-}
 
 #[program]
 pub mod hotwings {
@@ -95,16 +72,14 @@ pub mod hotwings {
             user.locked_tokens -= newly_unlocked;     // Reduce locked tokens
     
             // Transfer unlocked tokens to the user
-            // Call the helper function to handle the transfer logic
-            handle_transfer(
-                ctx.accounts.admin_wallet.clone(),
-                ctx.accounts.lock_pool_token_account.clone(),
-                user.user_wallet.clone(),
-                ctx.accounts.token_mint.clone(),
-                ctx.accounts.token_program.clone(),
-                ctx.accounts.system_program.clone(),
-                newly_unlocked,
-            );
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.lock_pool_token_account.to_account_info(),
+                to: user.user_wallet.to_account_info(),
+                authority: ctx.accounts.pda.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+            token::transfer(cpi_ctx, newly_unlocked)?;
         }
     
         // Update current milestone
@@ -112,18 +87,12 @@ pub mod hotwings {
     
         Ok(())
     }
-    
 
     pub fn full_unlock(ctx: Context<FullUnlock>) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
-        
+    
         // Ensure that the full unlock has not been executed yet
         require!(!lock_pool.full_unlock_executed, CustomError::FullUnlockAlreadyExecuted);
-
-        // Ensure the `admin_wallet` is the authorized signer
-        let admin = &ctx.accounts.admin_wallet;
-        require!(admin.is_signer, CustomError::Unauthorized); // Check if the admin is the signer
-        
     
         // Get the current Solana cluster time
         let current_time = ctx.accounts.clock.unix_timestamp;
@@ -145,32 +114,72 @@ pub mod hotwings {
                 user.locked_tokens = 0;
     
                 // Transfer all remaining locked tokens from lock pool account to the user's wallet
-                // let cpi_accounts = Transfer {
-                //     from: ctx.accounts.lock_pool_token_account.to_account_info(),
-                //     to: user.user_wallet.to_account_info(),
-                //     authority: ctx.accounts.pda.to_account_info(),
-                // };
-                // let cpi_program = ctx.accounts.token_program.to_account_info();
-                // let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+                let cpi_accounts = Transfer {
+                    from: ctx.accounts.lock_pool_token_account.to_account_info(),
+                    to: user.user_wallet.to_account_info(),
+                    authority: ctx.accounts.pda.to_account_info(),
+                };
+                let cpi_program = ctx.accounts.token_program.to_account_info();
+                let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
     
-                // token::transfer(cpi_ctx, newly_unlocked_tokens)?;
-                
-                // Transfer unlocked tokens to the user
-                // Call the helper function to handle the transfer logic
-                handle_transfer(
-                    ctx.accounts.admin_wallet.clone(),
-                    ctx.accounts.lock_pool_token_account.clone(),
-                    user.user_wallet.clone(),
-                    ctx.accounts.token_mint.clone(),
-                    ctx.accounts.token_program.clone(),
-                    ctx.accounts.system_program.clone(),
-                    newly_unlocked_tokens,
-                );
+                token::transfer(cpi_ctx, newly_unlocked_tokens)?;
             }
         }
     
         // Mark full unlock as executed
         lock_pool.full_unlock_executed = true;
+    
+        Ok(())
+    }
+
+    pub fn purchase_tokens(ctx: Context<PurchaseTokens>, total_paid_tokens: u64) -> Result<()> {
+        let lock_pool = &mut ctx.accounts.lock_pool_account;
+    
+        // Error 1: Ensure `total_paid_tokens` is greater than 0
+        require!(total_paid_tokens > 0, CustomError::InvalidTokenAmount);
+        // Determine the percentage of tokens to unlock immediately based on the current milestone
+        let unlock_percentage = milestone_percentage_from_milestone(lock_pool.current_milestone);
+    
+        // Calculate unlocked and locked tokens
+        let unlocked_tokens = total_paid_tokens * unlock_percentage as u64 / 100;
+        let locked_tokens = total_paid_tokens - unlocked_tokens;
+
+        // Error 2: Ensure the lock pool has enough tokens for the unlocked portion
+        require!(
+            ctx.accounts.lock_pool_token_account.amount >= unlocked_tokens,
+            CustomError::InsufficientPoolBalance
+        );
+    
+        // Handle unlocked tokens: Transfer `unlocked_tokens` directly to the user's wallet
+        if unlocked_tokens > 0 {
+            let cpi_accounts = Transfer {
+                from: ctx.accounts.lock_pool_token_account.to_account_info(),
+                to: ctx.accounts.user_token_account.to_account_info(),
+                authority: ctx.accounts.pda.to_account_info(),
+            };
+            let cpi_program = ctx.accounts.token_program.to_account_info();
+            let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+    
+            token::transfer(cpi_ctx, unlocked_tokens)?;
+        }
+    
+        // Handle locked tokens: Add locked tokens to the LockPoolState for this user
+        if locked_tokens > 0 {
+            // Check if the user is already in the LockPoolState
+            if let Some(user) = lock_pool.users.iter_mut().find(|u| u.user_wallet == ctx.accounts.user_wallet.key()) {
+                // Update existing user's locked tokens
+                user.total_tokens += locked_tokens;
+                user.locked_tokens += locked_tokens;
+            } else {
+                // Add new user entry to the LockPool
+                lock_pool.users.push(UserLockInfo {
+                    user_wallet: ctx.accounts.user_wallet.key(), // Buyer’s wallet
+                    total_tokens: locked_tokens,                 // Total tokens purchased
+                    locked_tokens,                              // Tokens still locked
+                    unlocked_tokens: 0,                         // Tokens immediately unlocked
+                });
+            }
+        }
     
         Ok(())
     }
@@ -210,8 +219,7 @@ pub struct LockPoolState {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
 pub struct UserLockInfo {
-    // pub user_wallet: Pubkey,            // Wallet address of the user
-    pub user_wallet: AccountInfo<'info>, // Receiver's public key
+    pub user_wallet: Pubkey,            // Wallet address of the user
     pub total_tokens: u64,              // Purchased tokens during presale
     pub unlocked_tokens: u64,           // Unlocked tokens (via milestones)
     pub locked_tokens: u64,             // Remaining locked tokens
@@ -228,8 +236,6 @@ pub struct UnlockTokens<'info> {
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the unlocking process
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
-    pub token_mint: Account<'info, Mint>, // SPL Token Mint
-    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -239,68 +245,63 @@ pub struct FullUnlock<'info> {
     #[account(mut)]
     pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled SPL token account (the lock pool)
     /// CHECK: PDA authority over the LockPool Token Account
-    // pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
+    pub pda: AccountInfo<'info>, // Program Derived Address (authority of LockPoolTokenAccount)
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // ADMIN WALLET to trigger the full unlock operation
     pub token_program: Program<'info, Token>, // SPL Token program for token transfers
     pub clock: Sysvar<'info, Clock>, // Solana Clock Sysvar to fetch current cluster time
-    pub token_mint: Account<'info, Mint>, // SPL Token Mint
-    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PurchaseTokens<'info> {
+    #[account(mut)]
+    pub lock_pool_account: Account<'info, LockPoolState>, // Global LockPoolState
+    #[account(mut)]
+    pub lock_pool_token_account: Account<'info, TokenAccount>, // PDA-controlled lock pool account
+    /// CHECK: Program Derived Address (PDA) for authority over the LockPool
+    pub pda: AccountInfo<'info>, // PDA authority for lock pool transfers
+    #[account(mut)]
+    pub user_wallet: Signer<'info>, // Buyer's wallet (receiving unlocked tokens)
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>, // Buyer's token account to receive unlocked tokens
+    pub token_program: Program<'info, Token>, // SPL Token Program
 }
 
 
-// Helper function to handle token transfer
-fn handle_transfer(
-    sender: Signer,
-    sender_token_account: Account<TokenAccount>,
-    receiver: AccountInfo,
-    token_mint: Account<Mint>,
-    token_program: Program<Token>,
-    system_program: Program<System>,
-    amount: u64,
-) -> Result<()> {
-    // Get the receiver's associated token account address
-    let receiver_ata = get_associated_token_address(&receiver.key(), &token_mint.key());
-
-    // Check if the receiver's associated token account exists; if not, create it
-    // let receiver_token_account_info = match anchor_lang::solana_program::account::Account::try_from_slice(&receiver_ata.to_bytes()) {
-    let receiver_token_account_info = match Account::<TokenAccount>::try_from(&receiver_ata.to_bytes()) {
-        Ok(account) => account,
-        Err(_) => {
-            // Create the associated token account
-            let create_ata_ix = spl_associated_token_account::create_associated_token_account(
-                &sender.key(),
-                &receiver.key(),
-                &token_mint.key(),
-            );
-
-            anchor_lang::solana_program::program::invoke(
-                &create_ata_ix,
-                &[
-                    sender.to_account_info(),
-                    receiver.to_account_info(),
-                    token_mint.to_account_info(),
-                    system_program.to_account_info(),
-                    token_program.to_account_info(),
-                ],
-            )?;
-            // After creation, retrieve the new associated token account info
-            Account::<TokenAccount>::try_from(&receiver_ata.to_bytes())?
-        }
-    };
-
-    // Transfer tokens from sender to receiver's associated token account
-    let cpi_accounts = token::Transfer {
-        from: sender_token_account.to_account_info(),
-        to: receiver_token_account_info.to_account_info(),
-        authority: sender.to_account_info(),
-    };
-
-    token::transfer(CpiContext::new(token_program.to_account_info(), cpi_accounts), amount)?;
-
-    Ok(())
+fn milestone_percentage(market_cap: u64) -> u8 {
+    if market_cap >= 2_500_000 {
+        return 100; // If the market cap exceeds or equals the last milestone, unlock 100%
+    } else if market_cap >= 1_574_000 {
+        return 70; // Milestone 7
+    } else if market_cap >= 997_000 {
+        return 60; // Milestone 6
+    } else if market_cap >= 650_000 {
+        return 50; // Milestone 5
+    } else if market_cap >= 395_000 {
+        return 40; // Milestone 4
+    } else if market_cap >= 225_000 {
+        return 30; // Milestone 3
+    } else if market_cap >= 105_500 {
+        return 20; // Milestone 2
+    } else if market_cap >= 45_000 {
+        return 10; // Milestone 1
+    }
+    0 // If market cap is below the first milestone, no tokens are unlocked
 }
 
+fn milestone_percentage_from_milestone(current_milestone: u8) -> u8 {
+    match current_milestone {
+        1 => 10, // Milestone 1: 10%
+        2 => 20, // Milestone 2: 20%
+        3 => 30, // Milestone 3: 30%
+        4 => 40, // Milestone 4: 40%
+        5 => 50, // Milestone 5: 50%
+        6 => 60, // Milestone 6: 60%
+        7 => 70, // Milestone 7: 70%
+        8 => 100, // Milestone 8: 100%
+        _ => 0,   // Fallback: No unlock for unknown milestones
+    }
+}
 
 #[error_code]
 pub enum CustomError {
@@ -310,8 +311,10 @@ pub enum CustomError {
     MilestoneNotReached,
     #[msg("Already Full Unlocked")]
     FullUnlockAlreadyExecuted,
-    // // #[msg("Max supply amount exceeded")]
-    // SupplyExceeded,
     #[msg("Three months have not yet passed since the token distribution.")]
     UnlockTooSoon,
+    #[msg("Invalid Token Amount")]
+    InvalidTokenAmount,
+    #[msg("Insufficient Pool Balance")]
+    InsufficientPoolBalance,
 }
