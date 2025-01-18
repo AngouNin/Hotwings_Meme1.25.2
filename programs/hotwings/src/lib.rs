@@ -7,6 +7,7 @@ use spl_token_2022::{
 use spl_token_extension_transfer_hook::instruction::process_transfer_hook;
 use solana_sdk::signature::Keypair;
 
+
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
 
 
@@ -200,6 +201,54 @@ pub mod hotwings {
         Ok(())
     }
 
+    pub fn finalize_unlock(ctx: Context<FinalizeUnlock>, auto_sell_amount: u64) -> Result<()> {
+        let lock_pool = &mut ctx.accounts.lock_pool_account;
+    
+        // (1) Ensure this function is only executed if the conditions are met
+        // Final milestone: Market cap is ≥ $2,500,000 OR 3-month timer has elapsed.
+    
+        let clock = Clock::get()?; // Get Solana cluster time
+        let current_time = clock.unix_timestamp;
+    
+        // Condition 1 - Final market cap milestone
+        let is_final_milestone = lock_pool.current_milestone >= 8;
+    
+        // Condition 2 - 3-month full unlock period elapsed
+        let is_three_month_unlock = current_time >= lock_pool.start_time + (3 * 30 * 24 * 60 * 60); // 3 months in seconds
+    
+        // Ensure at least one condition is met
+        require!(
+            is_final_milestone || is_three_month_unlock,
+            CustomError::UnlockTooSoon // Cannot call finalize unlock yet
+        );
+    
+        // (2) Auto-sell execution: 25% of tokens from project wallet
+        let project_wallet_tokens = ctx.accounts.project_wallet.amount; // Current tokens in project wallet
+        let auto_sell_tokens = project_wallet_tokens * 25 / 100; // Calculate the 25%
+    
+        // Ensure `auto_sell_amount` matches the calculation
+        require!(
+            auto_sell_tokens == auto_sell_amount,
+            CustomError::InvalidTokenAmount // Prevent invalid input
+        );
+    
+        // Perform the transfer of tokens from the project wallet to the DEX or liquidity wallet
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.project_wallet.to_account_info(), // Project wallet as source
+            to: ctx.accounts.dex_liquidity_wallet.to_account_info(), // DEX or liquidity wallet as destination
+            authority: ctx.accounts.project_wallet_authority.to_account_info(), // Authority of the project wallet
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+    
+        token::transfer(cpi_ctx, auto_sell_tokens)?;
+    
+        // (3) Update `is_max_hold_limit_active` to false
+        lock_pool.is_max_hold_limit_active = false; // Remove wallet cap restriction
+    
+        Ok(())
+    }
+
 
 }
 
@@ -253,6 +302,7 @@ pub struct LockPoolState {
     pub start_time: i64,  
     pub current_milestone: u8, 
     pub full_unlock_executed: bool
+    pub is_max_hold_limit_active: bool,  // NEW: Enable/Disable max hold restrictions
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
@@ -303,6 +353,21 @@ pub struct PurchaseTokens<'info> {
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>, // Buyer's token account to receive unlocked tokens
     pub token_program: Program<'info, Token>, // SPL Token Program
+}
+
+#[derive(Accounts)]
+pub struct FinalizeUnlock<'info> {
+    #[account(mut)]
+    pub lock_pool_account: Account<'info, LockPoolState>, // Global LockPoolState (tracks locking state across users)
+    /// CHECK: Project wallet (source of auto-sales)
+    #[account(mut)]
+    pub project_wallet: Account<'info, TokenAccount>, // Project/Presale Manager's wallet
+    /// CHECK: Authority over the `project_wallet`
+    pub project_wallet_authority: Signer<'info>, // Authority to approve sales from the project wallet
+    #[account(mut)]
+    pub dex_liquidity_wallet: Account<'info, TokenAccount>, // Wallet or DEX account receiving the auto-sell tokens
+    pub token_program: Program<'info, Token>, // SPL Token program for transfers
+    pub clock: Sysvar<'info, Clock>, // Solana Clock Sysvar to fetch current cluster time
 }
 
 
@@ -394,15 +459,17 @@ pub fn process_transfer_hook(ctx: Context<TransferHookContext>) -> Result<()> {
         let net_transfer = transfer_amount - tax;
         let lock_pool = &mut ctx.accounts.lock_pool_account;
 
-        // Enforce max hold restriction for non-exempt users
-        let mut total_balance = 0u64;
-        if let Some(user_lock) = lock_pool.user_locks.iter().find(|lock| lock.user == user) {
-            total_balance = user_lock.total_tokens;
-        }
-        if (total_balance + net_transfer > MAX_HOLD_AMOUNT &&
-           ctx.accounts.user.key() != YOUR_PROJECT_WALLET &&
-           ctx.accounts.user.key() != YOUR_MARKET_WALLET) {
-            return Err(CustomError::MaxHoldExceeded.into());
+        if lock_pool.is_max_hold_limit_active {
+            // Enforce max hold restriction for non-exempt users
+            let mut total_balance = 0u64;
+            if let Some(user_lock) = lock_pool.user_locks.iter().find(|lock| lock.user == user) {
+                total_balance = user_lock.total_tokens;
+            }
+            if (total_balance + net_transfer > MAX_HOLD_AMOUNT &&
+               ctx.accounts.user.key() != YOUR_PROJECT_WALLET &&
+               ctx.accounts.user.key() != YOUR_MARKET_WALLET) {
+                return Err(CustomError::MaxHoldExceeded.into());
+            }
         }
 
         // Burn tokens
@@ -521,15 +588,12 @@ fn is_dex_transaction(source_program_id: &Pubkey, destination_program_id: &Pubke
 
 // =====================================================Error=============================================
 
+
 #[error_code]
 pub enum CustomError {
     #[msg("You are not authorized to call this instruction.")]
     Unauthorized,
-    #[msg("Market cap is not reached")]
-    MilestoneNotReached,
-    #[msg("Already Full Unlocked")]
-    FullUnlockAlreadyExecuted,
-    #[msg("Three months have not yet passed since the token distribution.")]
+    #[msg("Market cap milestone or 3-month full unlock period not reached.")]
     UnlockTooSoon,
     #[msg("Invalid Token Amount")]
     InvalidTokenAmount,
@@ -537,4 +601,6 @@ pub enum CustomError {
     InsufficientPoolBalance,
     #[msg("Max hold amount exceeded")]
     MaxHoldExceeded,
+    #[msg("Already Full Unlocked")]
+    FullUnlockAlreadyExecuted,
 }
