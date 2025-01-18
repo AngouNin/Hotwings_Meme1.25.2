@@ -59,7 +59,7 @@ pub mod hotwings {
     pub fn unlock_tokens(ctx: Context<UnlockTokens>, market_cap: u64) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
 
-        // Ensure the `admin_wallet` is the authorized signer
+        // Ensure the admin wallet is authorized
         let admin = &ctx.accounts.admin_wallet;
         require!(admin.is_signer, CustomError::Unauthorized); // Check if the admin is the signer
     
@@ -69,6 +69,9 @@ pub mod hotwings {
     
         // Ensure we don’t process the same milestone multiple times
         require!(percentage > current_milestone * 10, CustomError::MilestoneNotReached);
+
+        let percentage = milestone_percentage(market_cap);
+        require!(percentage > 0, CustomError::MilestoneNotReached);
         
         for user in lock_pool.users.iter_mut() {
             let total_to_unlock = user.total_tokens * percentage as u64 / 100;
@@ -201,50 +204,39 @@ pub mod hotwings {
         Ok(())
     }
 
-    pub fn finalize_unlock(ctx: Context<FinalizeUnlock>, auto_sell_amount: u64) -> Result<()> {
+    pub fn finalize_unlock(ctx: Context<FinalizeUnlock>) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
-    
-        // (1) Ensure this function is only executed if the conditions are met
-        // Final milestone: Market cap is ≥ $2,500,000 OR 3-month timer has elapsed.
-    
+        
         let clock = Clock::get()?; // Get Solana cluster time
         let current_time = clock.unix_timestamp;
     
-        // Condition 1 - Final market cap milestone
-        let is_final_milestone = lock_pool.current_milestone >= 8;
+        // Ensure unlock conditions are met: either final milestone or 3-month full unlock
+        let unlock_condition_met = lock_pool.current_milestone >= 8
+            || current_time >= lock_pool.start_time + (3 * 30 * 24 * 60 * 60); // 3 months
+        require!(unlock_condition_met, CustomError::UnlockTooSoon);
     
-        // Condition 2 - 3-month full unlock period elapsed
-        let is_three_month_unlock = current_time >= lock_pool.start_time + (3 * 30 * 24 * 60 * 60); // 3 months in seconds
+        // Calculate 25% auto-sell amount
+        let auto_sell_tokens = ctx
+            .accounts
+            .project_wallet
+            .amount
+            .checked_mul(25)
+            .and_then(|v| v.checked_div(100))
+            .ok_or(CustomError::InvalidTokenAmount)?;
     
-        // Ensure at least one condition is met
-        require!(
-            is_final_milestone || is_three_month_unlock,
-            CustomError::UnlockTooSoon // Cannot call finalize unlock yet
-        );
+        require!(auto_sell_tokens > 0, CustomError::InvalidTokenAmount);
     
-        // (2) Auto-sell execution: 25% of tokens from project wallet
-        let project_wallet_tokens = ctx.accounts.project_wallet.amount; // Current tokens in project wallet
-        let auto_sell_tokens = project_wallet_tokens * 25 / 100; // Calculate the 25%
-    
-        // Ensure `auto_sell_amount` matches the calculation
-        require!(
-            auto_sell_tokens == auto_sell_amount,
-            CustomError::InvalidTokenAmount // Prevent invalid input
-        );
-    
-        // Perform the transfer of tokens from the project wallet to the DEX or liquidity wallet
+        // Perform token transfer for auto-sell
         let cpi_accounts = Transfer {
-            from: ctx.accounts.project_wallet.to_account_info(), // Project wallet as source
-            to: ctx.accounts.dex_liquidity_wallet.to_account_info(), // DEX or liquidity wallet as destination
-            authority: ctx.accounts.project_wallet_authority.to_account_info(), // Authority of the project wallet
+            from: ctx.accounts.project_wallet.to_account_info(),
+            to: ctx.accounts.dex_liquidity_wallet.to_account_info(),
+            authority: ctx.accounts.project_wallet_authority.to_account_info(),
         };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-    
+        let cpi_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts);
         token::transfer(cpi_ctx, auto_sell_tokens)?;
     
-        // (3) Update `is_max_hold_limit_active` to false
-        lock_pool.is_max_hold_limit_active = false; // Remove wallet cap restriction
+        // Deactivate maximum hold limit
+        lock_pool.is_max_hold_limit_active = false;
     
         Ok(())
     }
@@ -286,7 +278,7 @@ pub struct InitializeLockAccounts<'info> {
     #[account(mut)]
     pub admin_wallet: Signer<'info>, // Wallet signing token transfers (Presale Manager)
     pub token_program: Program<'info, Token>, // Standard SPL Token program
-    pub clock: Sysvar<'info, Clock>, // Add the SysvarClock system account to fetch cluster time
+    pub clock: Sysvar<'info, Clock>, // Fetch cluster time from SysvarClock
 }
 
 #[derive(Clone, AnchorSerialize, AnchorDeserialize, Debug)]
@@ -460,18 +452,16 @@ pub fn process_transfer_hook(ctx: Context<TransferHookContext>) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
 
         if lock_pool.is_max_hold_limit_active {
-            // Enforce max hold restriction for non-exempt users
-            let mut total_balance = 0u64;
-            if let Some(user_lock) = lock_pool.user_locks.iter().find(|lock| lock.user == user) {
-                total_balance = user_lock.total_tokens;
-            }
-            if (total_balance + net_transfer > MAX_HOLD_AMOUNT &&
-               ctx.accounts.user.key() != YOUR_PROJECT_WALLET &&
-               ctx.accounts.user.key() != YOUR_MARKET_WALLET) {
-                return Err(CustomError::MaxHoldExceeded.into());
-            }
+            let user_hold_amount = lock_pool.users.iter()
+                .find(|u| u.user_wallet == ctx.accounts.user_wallet.key())
+                .map_or(0, |u| u.total_tokens + net_transfer);
+        
+            require!(
+                user_hold_amount <= MAX_HOLD_AMOUNT,
+                CustomError::MaxHoldExceeded
+            );
         }
-
+    
         // Burn tokens
         let cpi_ctx_burn = CpiContext::new_with_signer(
             ctx.accounts.token_program.to_account_info(),
@@ -593,7 +583,7 @@ fn is_dex_transaction(source_program_id: &Pubkey, destination_program_id: &Pubke
 pub enum CustomError {
     #[msg("You are not authorized to call this instruction.")]
     Unauthorized,
-    #[msg("Market cap milestone or 3-month full unlock period not reached.")]
+    #[msg("Conditions not met: Final milestone or 3-month unlock period.")]
     UnlockTooSoon,
     #[msg("Invalid Token Amount")]
     InvalidTokenAmount,
@@ -603,4 +593,6 @@ pub enum CustomError {
     MaxHoldExceeded,
     #[msg("Already Full Unlocked")]
     FullUnlockAlreadyExecuted,
+    #[msg("Insufficient Pool Balance")]
+    InsufficientPoolBalance,
 }
