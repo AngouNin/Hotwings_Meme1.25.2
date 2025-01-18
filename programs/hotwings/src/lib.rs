@@ -1,11 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{Token, TokenAccount, Transfer};
-use spl_token_2022::{
-    instruction::{initialize_mint_with_extension, ExtensionType},
-    state::Mint,
-};
-use spl_token_extension_transfer_hook::instruction::process_transfer_hook;
-
+use anchor_spl::token::{Token, TokenAccount, Transfer}; 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
 
@@ -566,7 +560,7 @@ const ORCA_PROGRAM_ID_MAIN_1: Pubkey = Pubkey::new_from_array([whirLbMiicVdio4qv
 // Helper function to determine if a transaction is associated with a DEX
 fn is_dex_transaction(source_program_id: &Pubkey, destination_program_id: &Pubkey) -> bool {
     // Known DEX program IDs
-    const KNOWN_DEX_PROGRAMS: [&Pubkey; 3] = [
+    const KNOWN_DEX_PROGRAMS: [&Pubkey; 19] = [
         &SERUM_DEX_PROGRAM_ID_DEV_1,
         &SERUM_DEX_PROGRAM_ID_MAIN_1,
         &RAYDIUM_PROGRAM_ID_DEV_1,
