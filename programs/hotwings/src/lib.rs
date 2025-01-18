@@ -5,7 +5,6 @@ use spl_token_2022::{
     state::Mint,
 };
 use spl_token_extension_transfer_hook::instruction::process_transfer_hook;
-use solana_sdk::signature::Keypair;
 
 
 declare_id!("6vxBssG3FvWset4jv3STQGGnq3mTqkkD2BSbYC5s7j89");
@@ -23,6 +22,16 @@ pub mod hotwings {
     ) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
 
+        // ✅ Security: Check if pool is already initialized
+        require!(
+            ctx.accounts.lock_pool_token_account.owner == ctx.accounts.pda.key(),
+            CustomError::Unauthorized
+        );
+        require!(
+            lock_pool.start_time == 0,
+            CustomError::AlreadyInitialized
+        );
+
          // Step 1: Initialize start_time if not already set
         if lock_pool.start_time == 0 {
             // Fetch current cluster time
@@ -31,6 +40,9 @@ pub mod hotwings {
         }
 
         for user in users.iter() {
+            // ✅ Security Check: Ensure token amount is valid
+            require!(user.token_amount > 0, CustomError::InvalidTokenAmount);
+
             // Step 1: Transfer tokens to the shared lock pool token account
             let cpi_accounts = Transfer {
                 from: ctx.accounts.source_wallet.to_account_info(), // Admin's source wallet
@@ -58,6 +70,11 @@ pub mod hotwings {
 
     pub fn unlock_tokens(ctx: Context<UnlockTokens>, market_cap: u64) -> Result<()> {
         let lock_pool = &mut ctx.accounts.lock_pool_account;
+        // ✅ Security Check: Ensure caller is admin
+        require!(
+            ctx.accounts.admin_wallet.key() == ctx.accounts.pda.key(),
+            CustomError::Unauthorized
+        );
 
         // Ensure the admin wallet is authorized
         let admin = &ctx.accounts.admin_wallet;
@@ -581,8 +598,10 @@ fn is_dex_transaction(source_program_id: &Pubkey, destination_program_id: &Pubke
 
 #[error_code]
 pub enum CustomError {
-    #[msg("You are not authorized to call this instruction.")]
+    #[msg("Unauthorized: You do not have permission to call this method.")]
     Unauthorized,
+    #[msg("Milestone has not been reached for token unlock.")]
+    MilestoneNotReached,
     #[msg("Conditions not met: Final milestone or 3-month unlock period.")]
     UnlockTooSoon,
     #[msg("Invalid Token Amount")]
@@ -595,4 +614,6 @@ pub enum CustomError {
     FullUnlockAlreadyExecuted,
     #[msg("Insufficient Pool Balance")]
     InsufficientPoolBalance,
+    #[msg("Lock accounts have already been initialized.")]
+    AlreadyInitialized,
 }
